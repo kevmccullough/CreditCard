@@ -1,0 +1,319 @@
+---
+title: "CreditCard Fraud Detection"
+author: "Kevin McCullough"
+date: "May 15, 2017"
+output: html_document
+---
+Built with
+`r getRversion()`
+
+### In this program, I am analyzing a credit card dataset to predict fraud.  The data is highly imbalanced, so I will use Area Under Curve of an ROC model, and F1 scores as my criteria for selection. AUC is maximized with the best balance of the true positive and false positive rate, and F1 is a combination of precision and recall, that is maximized by finding a good balance of each, and not sacrificing one metric for the other.  Accuracy will be monitored, but is not a great metric for highly unbalanced data.
+
+# Set Working Directory
+```{r wd}
+setwd('C:/Users/m339673/Desktop/CreditCard')
+```
+
+# Load Libraries
+```{r lib, , message=FALSE}
+library(randomForest)
+library(e1071)
+library(rpart)
+library(rpart.plot)
+library(DMwR)
+library(ROCR)
+library(class)
+library(ggplot2)
+```
+
+# Inputting Data and viewing summary of variables
+``` {r summ}
+card <- read.csv("creditcard.csv")
+summary(card)
+head(card,n=5)
+```
+
+# Modify the variables
+``` {r convert}
+card$Class<-factor(card$Class) #Class variable to factor
+card$Amount_scaled<-scale(card$Amount) #Scale the amount
+```
+
+# Variables to use for modeling(Removing Time and Amount)
+``` {r vars}
+vars.to.use<-colnames(card)[c(-1,-30)]
+data<-as.data.frame(card[,vars.to.use])
+numericVars<-colnames(data[c(-29,-31)])
+outcome<-'Class'
+pos<-'1'
+```
+
+# Split data into training and test datasets
+``` {r split}
+set.seed(1234)
+data$gp<-runif(dim(data)[1])
+test<-subset(data, data$gp<=.3) #test data
+train<-subset(data, data$gp>.3) #initial training before split
+```
+
+# Check output Class distribution for baseline accuracy
+``` {r baseline}
+as.numeric(table(train$Class)[1]/dim(train)[1])
+as.numeric(table(test$Class)[1]/dim(test)[1])
+```
+
+
+# Balance training data using SMOTE to balance classes
+``` {r balance}
+newcard<-SMOTE(Class ~ .,train,perc.over=10000, perc.under=101)
+table(newcard$Class)
+```
+
+# Split balanced training data into training and calibration datasets
+```{r splittrain}
+useforCal<-rbinom(n=dim(newcard)[[1]],size=1, prob=0.1)>0 #index rows to be used for calibration
+Cal<-subset(newcard,useforCal) #calibration data
+credtrain<-subset(newcard,!useforCal) #training data
+dim(credtrain)[1]
+dim(Cal)[1]
+```
+
+# Check output Class distribution for new training and calibration sets
+``` {r baseline_train}
+as.numeric(table(credtrain$Class)[1]/dim(credtrain)[1])
+as.numeric(table(Cal$Class)[1]/dim(Cal)[1])
+```
+
+# Start modeling process with building single variable models as baseline
+## Convenience function to calculate Area Under Curve AUC
+``` {r calcAUC}
+calcAUC <- function(predcol,outcol) {
+  perf <- performance(prediction(predcol,outcol==pos),'auc')
+  as.numeric(perf@y.values)
+}
+```
+
+## Convenience Functions to give class probabilities for Class and Numeric Variables
+``` {r makepred}
+mkPredC <- function(outCol,varCol,fraudCol) { 
+  pPos <- sum(outCol==pos)/length(outCol) 
+  naTab <- table(as.factor(outCol[is.na(varCol)]))
+  pPosWna <- (naTab/sum(naTab))[as.character(pos)] 
+  vTab <- table(as.factor(outCol),varCol)
+  pPosWv <- (vTab[as.character(pos),]+1.0e-3*pPos)/(colSums(vTab)+1.0e-3)
+  pred <- pPosWv[fraudCol]
+  pred[is.na(fraudCol)] <- pPosWna
+  pred[is.na(pred)] <- pPos
+  pred 
+}
+
+mkPredN<-function(outCol, varCol,fraudCol) {
+  cuts<-unique(as.numeric(quantile(varCol,
+    probs=seq(0,1,0.1),na.rm=T)))
+  varC<-cut(varCol,cuts)
+  fraudC<-cut(fraudCol,cuts)
+  mkPredC(outCol,varC,fraudC)
+}
+```
+
+# Calculate AUC for all variables and print if AUC>.85 on Training data
+``` {r AUCsingle}
+for(v in numericVars) {
+  pi <- paste('pred',v,sep='')
+  credtrain[,pi] <- mkPredN(credtrain[,outcome],credtrain[,v],credtrain[,v])
+  test[,pi] <- mkPredN(credtrain[,outcome],credtrain[,v],test[,v])
+  Cal[,pi] <- mkPredN(credtrain[,outcome],credtrain[,v],Cal[,v])
+  aucTrain <- calcAUC(credtrain[,pi],credtrain[,outcome])
+  if(aucTrain>=0.85) {
+    aucCal <- calcAUC(Cal[,pi],Cal[,outcome])
+    print(sprintf("%s, trainAUC: %4.3f calibrationAUC: %4.3f",
+                  pi,aucTrain,aucCal))
+  }
+}
+```
+
+# Attempt to build a decision tree
+
+``` {r decisiontree}
+
+#Variable selection by picking variables with deviance improvement on Calibration dataset
+
+logLikelyhood <- function(outCol,predCol) {
+  sum(ifelse(outCol==pos,log(predCol),log(1-predCol)))
+}
+
+selVars <- c()
+minStep <- 5
+baseRateCheck <- logLikelyhood(Cal[,outcome],
+                               sum(Cal[,outcome]==pos)/length(Cal[,outcome]))
+
+for(v in numericVars) { 
+  pi <- paste('pred',v,sep='')
+  liCheck <- 2*((logLikelyhood(Cal[,outcome],Cal[,pi]) -
+                   baseRateCheck))
+  if(liCheck>=minStep) {
+    print(sprintf("%s, calibrationScore: %g",
+                  pi,liCheck))
+    selVars <- c(selVars,pi)
+  }
+}
+
+
+f <- paste(outcome,'==1 ~ ',paste(selVars,collapse=' + '),sep='') #Building the formula using the Variables that improved deviance
+tmodel <- rpart(f,data=credtrain,
+                control=rpart.control(cp=0.001,minsplit=1000,
+                                      minbucket=1000,maxdepth=5)
+)
+
+#Save predictions as a variable in each dataset
+credtrain$tpred<-predict(tmodel,newdata=credtrain)
+Cal$tpred<-predict(tmodel,newdata=Cal)
+test$tpred<-predict(tmodel,newdata=test)
+
+calcAUC(credtrain$tpred,credtrain[,outcome])
+calcAUC(Cal$tpred,Cal[,outcome])
+calcAUC(test$tpred,test[,outcome]) 
+```
+
+## AUC on Test Data: 0.9806518
+
+``` {r treeprint}
+prp(tmodel) 
+```
+
+# Attempt to build a nearest neighbor model
+```{r nearestneighbor}
+nK<-250 #Number of neighbors analyzed
+knnTrain<-credtrain[,selVars] #variables used for classification
+knnCl<-credtrain[,outcome]==pos #training outcomes
+
+
+knnPred <- function(df) {
+  knnDecision <- knn(knnTrain,df,knnCl,k=nK,prob=T)
+  ifelse(knnDecision==TRUE,
+         attributes(knnDecision)$prob,
+         1-(attributes(knnDecision)$prob))
+}
+
+credtrain$nnpred<-knnPred(credtrain[,selVars])
+Cal$nnpred<-knnPred(Cal[,selVars])
+test$nnpred<-knnPred(test[,selVars])
+
+
+calcAUC(credtrain$nnpred,credtrain[,outcome])
+calcAUC(Cal$nnpred,Cal[,outcome])
+calcAUC(test$nnpred,test[,outcome]) 
+
+```
+
+## AUC on Test Data: 0.98768
+
+
+# Attempt a Naive Bayes model
+``` {r naivebayes}
+ff <- paste('as.factor(',outcome,'==1) ~ ',
+            paste(selVars,collapse=' + '),sep='')
+
+nbmodel<-naiveBayes(as.formula(ff), data=credtrain)
+
+credtrain$nbpred<-predict(nbmodel,newdata=credtrain,type='raw')[,'TRUE']
+Cal$nbpred<-predict(nbmodel,newdata=Cal,type='raw')[,'TRUE']
+test$nbpred<-predict(nbmodel,newdata=test,type='raw')[,'TRUE']
+
+calcAUC(credtrain$nbpred,credtrain[,outcome])
+calcAUC(Cal$nbpred,Cal[,outcome])
+calcAUC(test$nbpred,test[,outcome])
+```
+## AUC on Test Data: 0.98449
+
+# Try logistic regression model
+```{r logistic_reg}
+fm <- paste(outcome,'==1 ~ ',paste(numericVars,collapse=' + '),sep='')
+
+model<-glm(fm, data=credtrain, family=binomial(link="logit"))
+credtrain$logpred<-predict(model, newdata=credtrain, type="response")
+Cal$logpred<-predict(model, newdata=Cal, type="response")
+test$logpred<-predict(model,newdata=test, type="response")
+
+calcAUC(credtrain$logpred,credtrain[,outcome])
+calcAUC(Cal$logpred,Cal[,outcome])
+calcAUC(test$logpred,test[,outcome]) #AUC=.9888959
+```
+## AUC on Test Data: 0.9888959
+
+
+# Try Random Forest
+``` {r randomforest}
+fmodel<-randomForest(x=credtrain[,numericVars],
+                     y=credtrain$Class,
+                     ntree=100,
+                     nodesize=7,
+                     importance=T)
+
+varImp<-importance(fmodel)
+varImp[1:10,]
+varImpPlot(fmodel,type=1)
+selVars<-names(sort(varImp[,1], decreasing=T))[1:15]
+
+fmodel<-randomForest(x=credtrain[,selVars],
+                     y=credtrain$Class,
+                     ntree=1000,
+                     nodesize=7,
+                     importance=T)
+
+
+fresults<-predict(fmodel,newdata=credtrain, "prob")
+fresultsCal<-predict(fmodel,newdata=Cal, "prob")
+fresultstest<-predict(fmodel,newdata=test, "prob")
+
+credtrain$forestpred<-fresults[,2]
+Cal$forestpred<-fresultsCal[,2]
+test$forestpred<-fresultstest[,2]
+
+calcAUC(credtrain$forestpred,credtrain[,outcome])
+calcAUC(Cal$forestpred,Cal[,outcome])
+calcAUC(test$forestpred,test[,outcome])  #AUC: .992192
+```
+## AUC on Test Data: 0.992192
+
+# Measure accuracy, F1 and deviance to compare models
+``` {r compare}
+#Functions to measure accuracy, F1 and deviance to compare models
+loglikelihood <- function(y, py) {   	# Note: 3 
+  pysmooth <- ifelse(py==0, 1e-12,
+                     ifelse(py==1, 1-1e-12, py))
+  
+  sum(y * log(pysmooth) + (1-y)*log(1 - pysmooth))
+}
+
+accuracyMeasures <- function(pred, truth, name="model") { 
+  dev.norm <- -2*loglikelihood(as.numeric(truth), pred)/length(pred)
+  ctable <- table(truth=truth,
+                  pred=(pred>0.5))                            
+  accuracy <- sum(diag(ctable))/sum(ctable)
+  precision <- ctable[2,2]/sum(ctable[,2])
+  recall <- ctable[2,2]/sum(ctable[2,])
+  f1 <- 2*precision*recall/(precision+recall)
+  data.frame(model=name, accuracy=accuracy, f1=f1, dev.norm)
+}
+## Decision Tree
+accuracyMeasures(test$tpred, test$Class==1, name='Decision Tree, test')
+##Naive Bayes
+accuracyMeasures(test$nbpred, test$Class==1, name='Naive Bayes, test')
+##Nearest Neighbor
+accuracyMeasures(test$nnpred, test$Class==1, name='Nearest Neighbor, test')
+##Logistic Regression
+accuracyMeasures(test$logpred, test$Class==1, name='Logistic Regression, test')
+##Random Forest
+accuracyMeasures(test$forestpred, test$Class==1, name='Random Forest, test')
+```
+
+## The Random Forest Model appears to provide the best model to predict new cases of fraud, based on the F1 score and the AUC.  The accuracy and deviance metrics are also the best of the various models.
+
+### Plot distribution of prediction scores
+``` {r distplot}
+ggplot(test, aes(x=forestpred, color=Class, linetype=Class))+
+  geom_density()
+```
+
+### High predicted scores tend to be fraud, while low scores do not.

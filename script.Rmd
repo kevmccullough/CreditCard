@@ -1,0 +1,146 @@
+
+```{r}
+system("ls ../input", intern=TRUE)
+```
+
+## load libraries
+
+```{r warning=F, message=F}
+
+library(randomForest)
+library(e1071)
+library(rpart)
+library(rpart.plot)
+library(caTools)
+library(readr)
+library(caret)
+```
+
+## getting input
+
+```{r warning=F}
+
+card <- read_csv("../input/creditcard.csv")
+str(card)
+
+# convert class variable to factor
+card$Class <- factor(card$Class)
+
+```
+
+# Predictive Modelling
+
+## split data 70:30
+
+```{r warning=F}
+set.seed(1)
+split <- sample.split(card$Class, SplitRatio = 0.7)
+train <- subset(card, split == T)
+cv <- subset(card, split == F)
+
+# check output Class distributiion
+table(cv$Class)
+
+```
+
+### baseline accuracy --> 99.826785 %
+
+## logistic regression
+
+```{r warning=F}
+
+glm.model <- glm(Class ~ ., data = train, family = "binomial")
+glm.predict <- predict(glm.model, cv, type = "response")
+table(cv$Class, glm.predict > 0.5)
+```
+
+### 99.900518 % accuracy using logistic regression model.
+
+## Decision tree model
+
+```{r warning=F}
+
+tree.model <- rpart(Class ~ ., data = train, method = "class", minbucket = 20)
+prp(tree.model) 
+tree.predict <- predict(tree.model, cv, type = "class")
+confusionMatrix(cv$Class, tree.predict)
+```
+
+### 99.925096 % accuracy (best) using decision tree.
+
+
+
+## Now we only keep 10000 rows of data with class = 0
+
+```{r warning=F}
+data.class.0 <- subset(card, card$Class == 0)
+data.class.1 <- subset(card, card$Class == 1)
+nrow(data.class.0)
+nrow(data.class.1)
+data.class.0 <- data.class.0[1:10000, ]
+nrow(data.class.0)
+data <- rbind(data.class.0, data.class.1)
+nrow(data)
+
+```
+
+## split data 70:30
+
+```{r warning=F}
+set.seed(1)
+split <- sample.split(data$Class, SplitRatio = 0.7)
+train <- subset(data, split == T)
+cv <- subset(data, split == F)
+
+table(cv$Class)
+```
+
+### baseline accuracy --> 95.298602 %
+
+## logistic regression
+
+```{r warning=F}
+glm.model <- glm(Class ~ ., data = train, family = "binomial", control = list(maxit = 50))
+glm.predict <- predict(glm.model, cv, type = "response")
+table(cv$Class, glm.predict > 0.5)
+```
+
+### 99.809402 % accuracy
+
+## SVM model
+
+```{r warning=F}
+svm.model <- svm(Class ~ ., data = train, kernel = "radial", cost = 1, gamma = 0.1)
+svm.predict <- predict(svm.model, cv)
+confusionMatrix(cv$Class, svm.predict)
+```
+
+### 98.856416 % accuracy
+
+## Decision Tree Model
+
+```{r warning=F}
+tree.model <- rpart(Class ~ ., data = train, method = "class", minbucket = 20)
+prp(tree.model) 
+tree.predict <- predict(tree.model, cv, type = "class")
+confusionMatrix(cv$Class, tree.predict)
+```
+
+### 100 % accuracy !!
+
+## Let's try random forest as well.
+
+## random forest model
+
+```{r warning=F}
+set.seed(10)
+rf.model <- randomForest(Class ~ ., data = train,
+                         ntree = 2000, nodesize = 20)
+
+rf.predict <- predict(rf.model, cv)
+confusionMatrix(cv$Class, rf.predict)
+varImpPlot(rf.model)
+
+```
+
+### Random forest also gives 100 % accuracy.
